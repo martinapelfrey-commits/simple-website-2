@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "../ASPX/BlazorApp2/Components/Layout"
+		},
+		{
+			"path": "../ASPX/BlazorApp2/Properties"
+		},
+		{
+			"path": "../ASPX/BlazorApp2/wwwroot"
+		},
+		{
+			"path": "../ASPX/BlazorApp2/bin"
+		},
+		{
+			"path": "../ASPX/BlazorApp2/Components"
+		},
+		{
+			"path": "../ASPX/BlazorApp2/obj"
+		}
+	],
+	"settings": {}
+}

@@ -1,0 +1,203 @@
+////////////////////////
+////  READSPEAKER  ////
+///////////////////////
+window.rsConf = {docReader: {}};
+(function() {
+    jQuery.ajax({
+        url: "//cdn-na.readspeaker.com/script/11574/webReaderForEducation/canvas/current/ReadSpeaker.Canvas.js",
+        dataType: 'script',
+        async: true,
+        cache: true
+    });
+})();
+////////////////////////////
+////  END READSPEAKER  ////
+///////////////////////////
+
+////////////////////////////////////////////////////
+// DESIGNPLUS CONFIG                            //
+////////////////////////////////////////////////////
+// Legacy
+var DT_variables = {
+iframeID: '',
+        // Path to the hosted USU Design Tools
+        path: 'https://designtools.ciditools.com/',
+        templateCourse: '199',
+        // OPTIONAL: Button will be hidden from view until launched using shortcut keys
+        hideButton: true,
+         // OPTIONAL: Limit by course format
+         limitByFormat: false, // Change to true to limit by format
+         // adjust the formats as needed. Format must be set for the course and in this array for tools to load
+         formatArray: [
+            'online',
+            'on-campus',
+            'blended'
+        ],
+        // OPTIONAL: Limit tools loading by users role
+        limitByRole: true, // set to true to limit to roles in the roleArray
+        // adjust roles as needed
+        roleArray: [
+            'admin',
+            'teacher'
+        ],
+        // OPTIONAL: Limit tools to an array of Canvas user IDs
+        limitByUser: false, // Change to true to limit by user
+        // add users to array (Canvas user ID not SIS user ID)
+        userArray: [
+            '1234',
+            '987654'
+        ],
+         // OPTIONAL: Relocate Ally alternative formats dropdown and hide heading
+         overrideAllyHeadings: false,
+         // OPTIONAL: Make assignment rubrics sortable
+         sortableRubrics: false,
+         // OPTIONAL: Transform people page ina course to show student cards
+         showStudentCards: false        // Paste variables from existing code here
+};
+
+// New
+DpPrimary = {
+    lms: 'canvas',
+    templateCourse: '20278',
+    hideButton: true,
+    hideLti: false,
+    extendedCourse: '', // added in sub-account theme
+    sharedCourse: '', // added from localStorage
+    courseFormats: [],
+    canvasRoles: ['admin',
+            'teacher'],
+    canvasUsers: [],
+    canvasCourseIds: [],
+    plugins: [],
+    excludedModules: [],
+    includedModules: [],
+    lang: 'en',
+    defaultToLegacy: true,
+    enableVersionSwitching: true,
+    hideSwitching: false,
+}
+
+// merge with extended/shared customizations config
+DpConfig = { ...DpPrimary, ...(window.DpConfig ?? {}) }
+
+$(function () {
+    const uriPrefix = (location.href.includes('.beta.')) ? 'beta.' : '';
+    const toolsUri = (DpConfig.toolsUri) ? DpConfig.toolsUri : `https://${uriPrefix}designplus.ciditools.com/`;
+    $.getScript(`${toolsUri}js/controller.js`);
+});
+////////////////////////////////////////////////////
+// END DESIGNPLUS CONFIG                        //
+////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////
+// SYLLABUS IFRAME COURSE NUMBER HELPER           //
+////////////////////////////////////////////////////
+// This helper allows passing the current course  //
+// number to the syllabus iframe, since Canvas    //
+// doesn't support merge trags.                   //
+////////////////////////////////////////////////////
+(function() {
+window.addEventListener('message', function(evt) {
+    if (evt.data !== 'course_id_request') return;
+
+    var syllabus_frame = document.querySelector('.syllabus-frame');
+    if (!syllabus_frame) return;
+
+    var coursenum_match = document.location.pathname.match(/^\/courses\/(\d+)/);
+    if (!coursenum_match) return;
+
+    syllabus_frame.contentWindow.postMessage(
+        'course_id_response:' + coursenum_match[1],
+        'https://www.indianatech.edu'
+    );
+});
+})();
+////////////////////////////////////////////////////
+// END SYLLABUS IFRAME COURSE NUMBER HELPER       //
+////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////
+// IFRAME RESIZER                                 //
+////////////////////////////////////////////////////
+// This helper allows passing the height of a     //
+// child frame back to the parent in order to     //
+// make a responsive iframe.                      //
+////////////////////////////////////////////////////
+window.addEventListener('message', function(evt) {
+    if (typeof evt.data !== 'string') return;
+    var resize_match = null;
+    if (resize_match = evt.data.match(/^resize_child:(\d+)/)) {
+        document.querySelector('#content-wrapper iframe').style.height = resize_match[1] + 'px';
+    }
+});
+////////////////////////////////////////////////////
+// END IFRAME RESIZER                             //
+////////////////////////////////////////////////////
+
+//////////////////////////
+////  YUJA PANORAMA  ////
+/////////////////////////
+(async function() {
+    const PANORAMA_SERVER_URL = 'https://panorama-api.yuja.com';
+    const panoramaIdentifierKey = 'b100c89f3f5792322bac6e718d99aae81bda4d8e28d13dccf825ceef2d5220b0';
+    const PANORAMA_CDN_URL = 'https://cdn-panorama.yuja.com';
+
+    window.PANORAMA_SERVER_URL = PANORAMA_SERVER_URL;
+    window.panoramaIdentifierKey = panoramaIdentifierKey;
+    window.PANORAMA_CDN_URL = PANORAMA_CDN_URL;
+
+    function loadScript(url) {
+        const script = document.createElement('script');
+        script.src = url;
+        document.head.appendChild(script);
+    }
+
+    try {
+        const response = await fetch(`${PANORAMA_SERVER_URL}/panorama-visualizer/canvas`, {cache: 'no-store'});
+        const scriptUrl = await response.text();
+        loadScript(scriptUrl);
+    } catch (e) {
+        console.error('Failed to load Panorama: ', e);
+    }
+})();
+//////////////////////////////
+////  END YUJA PANORAMA  ////
+/////////////////////////////
+
+//////////////////////////////////////////////////////////////////
+////  DISALLOWING STUDENTS TO CHANGE FULL AND SORTABLE NAME  ////
+/////////////////////////////////////////////////////////////////
+////  THIS ALLOWS STUDENTS TO CHANGE THEIR DISPLAY NAME  ////
+////  ONLY IN CANVAS                                     ////
+////////////////////////////////////////////////////////////
+(document.getElementById('user_sortable_name') || {}).readOnly = true;
+(document.getElementById('user_name') || {}).readOnly = true;
+//////////////////////////////////////////////////////////////////////
+////  END DISALLOWING STUDENTS TO CHANGE FULL AND SORTABLE NAME  ////
+/////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////
+////  HTML LECTURE PRESENTATION FIX  ////
+/////////////////////////////////////////
+document.addEventListener('DOMContentLoaded', function() {
+    Array.prototype.slice.apply(document.getElementsByTagName('iframe')).forEach(function(iframe) {
+        if ((iframe.src || '').indexOf('canvas-user-content') < 0) return;
+        if ((iframe.src || '').indexOf('index.html') < 0) return;
+        if ((iframe.src || '').indexOf('download=1') < 0) return;
+        if ((iframe.src || '').indexOf('inline=1') < 0) return;
+ 
+        iframe.sandbox = (iframe.sandbox || '') + ' allow-scripts';
+        iframe.src = iframe.src;
+    });
+});
+//////////////////////////////////////////////
+////  END HTML LECTURE PRESENTATION FIX  ////
+/////////////////////////////////////////////
+
+///////////////////
+////  REMILO  ////
+//////////////////
+(function(){try{var s=document.createElement('script');s.src="https://bifrost-api.us.tailoapp.com/bifrost-canvas-overrides.js";s.async=true;(document.head||document.documentElement).appendChild(s);}catch(e){}})();
+///////////////////////
+////  END REMILO  ////
+//////////////////////

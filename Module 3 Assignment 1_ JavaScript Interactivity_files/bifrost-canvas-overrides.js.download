@@ -1,0 +1,1567 @@
+// Remilo Canvas — inline accessibility chip decorator.
+//
+// Loaded into every Canvas page via BrandConfig.js_overrides (set by
+// provision/apply-theme.rb). Same role as `local_title2/decorator.js`
+// in Moodle, adapted for Canvas's DOM:
+//
+//   - Candidate anchors: <a href="/files/<id>"> and
+//     <a href="/courses/<cid>/files/<id>">. PDF gate via `?download`
+//     param presence OR /\.pdf(\?|#|$)/i on the visible link text.
+//   - Stable key: `f:<file_id>` parsed from the URL path.
+//   - Runtime config: read from `window.ENV` (Canvas's standard global)
+//     for current_user_id, current_user_roles, context_asset_string.
+//   - API base: hardcoded to title2-api.fly.dev for now (we'll
+//     parameterise via BrandConfig.variables once Patrick decides the
+//     bifrost-named API split, see plans/read-all-about-this-unified-fiddle.md).
+//   - Tokens CSS: fetched once from <api>/tailo-dark-tokens.css and shared
+//     by every chip's Shadow DOM (see "Shared tokens stylesheet").
+//
+// Skips: anonymous pages (no ENV.current_user_id), Canvas Site Admin
+// surfaces (avoid touching /accounts/site_admin/* admin chrome).
+//
+// Two-phase decoration with MutationObserver resilience copied from
+// the Moodle version — Canvas's React/Backbone hybrid re-renders
+// module-item rows after the initial paint, same race.
+
+(function () {
+    'use strict';
+
+    // ---------- Config ----------
+
+    // Self-configuring: the API base is WHEREVER THIS SCRIPT WAS LOADED FROM,
+    // so the same file serves staging and the QA mirror without edits. The
+    // hardcoded staging origin remains only as the fallback for exotic browsers
+    // with no document.currentScript. Tokens CSS rides the same origin: the API
+    // redirects /tailo-dark-tokens.css to its paired SPA (see title2-api
+    // src/index.ts), because the script cannot derive the SPA origin itself.
+    var SCRIPT_SRC = (document.currentScript && document.currentScript.src) || '';
+    var API_BASE   = SCRIPT_SRC ? new URL(SCRIPT_SRC).origin : 'https://bifrost-api.tailoapp.com';
+    var TOKENS_URL = API_BASE + '/tailo-dark-tokens.css';
+
+    // ---------- Shared tokens stylesheet ----------
+    // Fetched once and adopted by every chip's (and the pop-up's) shadow root.
+    // Chips wait for it: a per-chip @import painted each chip unstyled until
+    // its copy arrived. The SPA serves the file with Access-Control-Allow-Origin: *
+    // (nginx.conf). If the fetch fails or constructed sheets are unsupported,
+    // chips fall back to the per-chip @import.
+    var tokensSheet = null;
+    var tokensSheetPromise = null;
+
+    function loadTokensSheet() {
+        if (tokensSheetPromise) return tokensSheetPromise;
+        var supported = typeof CSSStyleSheet === 'function'
+            && typeof ShadowRoot === 'function'
+            && 'adoptedStyleSheets' in ShadowRoot.prototype
+            && 'replaceSync' in CSSStyleSheet.prototype;
+        tokensSheetPromise = !supported ? Promise.resolve(null)
+            : fetch(TOKENS_URL, { credentials: 'omit' })
+                .then(function (res) {
+                    if (!res.ok) throw new Error('tokens HTTP ' + res.status);
+                    return res.text();
+                })
+                .then(function (css) {
+                    var sheet = new CSSStyleSheet();
+                    sheet.replaceSync(css);
+                    tokensSheet = sheet;
+                    return sheet;
+                })
+                .catch(function (err) {
+                    if (window.console && console.warn) {
+                        console.warn('[bifrost] tokens stylesheet fetch failed; chips use @import', err);
+                    }
+                    return null;
+                });
+        return tokensSheetPromise;
+    }
+
+    // Nothing once the shared sheet is adopted, else the per-root @import.
+    function tokensImportRule() {
+        return tokensSheet ? '' : "@import url('" + TOKENS_URL + "');";
+    }
+
+    function adoptTokens(shadow) {
+        if (shadow && tokensSheet) shadow.adoptedStyleSheets = [tokensSheet];
+    }
+
+    // ---------- Heartbeat ----------
+    // Tell title2-api this Canvas is actually running the chip script, so
+    // the Remilo admin dashboard can show "Accessibility chips: Active".
+    // This is the only signal we have that custom JS is enabled + the
+    // script is installed (Canvas hides global_includes from the REST
+    // API). Throttled to once / 6h per browser; fire-and-forget; never
+    // breaks the page.
+    (function heartbeat() {
+        try {
+            var env = window.ENV || {};
+            if (!env.current_user_id) return; // skip anon / login page
+            var KEY = 'tailo_chip_hb';
+            var now = Date.now();
+            var last = parseInt(localStorage.getItem(KEY) || '0', 10);
+            if (now - last < 6 * 60 * 60 * 1000) return;
+            localStorage.setItem(KEY, String(now));
+            fetch(API_BASE + '/v1/lti/chip-heartbeat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ host: location.host }),
+                keepalive: true
+            }).catch(function () {});
+        } catch (e) { /* never break the host page */ }
+    })();
+
+    // ---------- Wider embedded reader (Bifrost-gated) ----------
+    // Canvas boxes an embedded LTI launch inside its content column. MEASURED
+    // (2026-09-06, live QA Canvas): the cap is
+    // `#wrapper.ic-Layout-wrapper { max-width: 1366px }` — every element below it
+    // (contentWrapper / contentMain / tool_content_wrapper) already has
+    // max-width:none and merely inherits it, so that is the only rule to lift.
+    // Canvas offers NO LTI width lever (lti.frameResize is height-only —
+    // canvas-lms #720/#541), so we widen it ourselves.
+    //
+    // But ONLY when the embedded BIFROST tool asks us to: the reader/admin app
+    // postMessages { type:'bifrost:lti-frame-width', full } from inside its
+    // iframe (carrying the effective institution-default + per-user-override
+    // choice). We accept it ONLY from a Bifrost origin (this script's paired SPA
+    // host, derived from its own API origin), so other vendors' embedded tools
+    // are never touched and a random frame can't drive it. Widening is pure
+    // layout, so this is not a security surface — the origin check is for
+    // correctness. The CSS is :has()-scoped to tool pages; a browser without
+    // :has() keeps today's width (safe no-op). The reader keeps its OWN readable
+    // line length inside the iframe.
+    (function toolWidthBridge() {
+        var ID = 'bifrost-tool-width';
+        var CSS =
+            '.ic-Layout-wrapper:has(.tool_content_wrapper){max-width:none !important}' +
+            '.tool_content_wrapper,.tool_content_wrapper>iframe.tool_launch{' +
+            'width:100% !important;max-width:none !important}';
+        // The reader/admin run on the SPA host paired with this API host
+        // (bifrost-api-qa.fly.dev → bifrost-qa.fly.dev; bifrost-api.tailoapp.com
+        // → bifrost.tailoapp.com). Accept the message from either.
+        var SPA_ORIGIN = API_BASE.replace('-api', '');
+
+        function setWidth(on) {
+            try {
+                var existing = document.getElementById(ID);
+                if (on && !existing) {
+                    var style = document.createElement('style');
+                    style.id = ID;
+                    style.textContent = CSS;
+                    (document.head || document.documentElement).appendChild(style);
+                } else if (!on && existing) {
+                    existing.parentNode.removeChild(existing);
+                }
+            } catch (e) { /* never break the host page */ }
+        }
+
+        window.addEventListener('message', function (e) {
+            try {
+                if (e.origin !== API_BASE && e.origin !== SPA_ORIGIN) return;
+                var d = e.data;
+                if (!d || d.type !== 'bifrost:lti-frame-width') return;
+                setWidth(!!d.full);
+            } catch (err) { /* ignore malformed messages */ }
+        });
+    })();
+
+    function getConfig() {
+        var env = window.ENV || {};
+        if (!env.current_user_id) return null; // anonymous (login page); skip
+        if (location.pathname.indexOf('/accounts/site_admin') === 0) return null;
+
+        var courseid = parseCourseId(env.context_asset_string);
+
+        // Derive a coarse role from window.ENV.current_user_roles. This
+        // IS account-level (not course-context), but for the chip's
+        // make-accessible CTA visibility that's a safe bias: if the
+        // user is a teacher / admin SOMEWHERE on this Canvas, showing
+        // them the chip is fine; the real auth check happens server-
+        // side on /v1/handoff click.
+        //
+        // Why send this at all? batch-status looks up the LtiUser row
+        // by (platform, canvas_user_id). On a user's FIRST encounter
+        // with the chip — before they've ever launched the tool via
+        // LTI — that row doesn't exist yet, so the server falls back
+        // to anonymous-student and the chip never renders. role_hint
+        // is the documented fast-path tiebreaker for that case (see
+        // resolveViewer step 4 in src/accessible/routes.ts). Matches
+        // the pattern Moodle's decorator has used since day one.
+        var roleHint = roleFromEnv(env);
+
+        return {
+            apiurl:   API_BASE,
+            // The page's own address. The API finds the platform by it: the LTI
+            // issuer of a self-hosted Canvas (its lti_iss override), or the Canvas
+            // base URL of an Instructure-hosted one, whose issuer is shared.
+            issuer:   location.origin,
+            canvasUserId: env.current_user_id,
+            courseid: courseid,
+            roleHint: roleHint
+        };
+    }
+
+    function roleFromEnv(env) {
+        // ENV.current_user_roles is an array of strings like:
+        //   ["user", "admin"]               — Site Admin
+        //   ["user", "teacher"]             — Faculty in any course
+        //   ["user", "student"]             — Enrolled student only
+        //   ["user", "fake_student"]        — Canvas's masquerade fake
+        //   ["user"]                        — Account user, no enrollment
+        // Map to our three-way enum. Admin wins over teacher wins over
+        // student (least-privilege fallthrough).
+        var roles = (env.current_user_roles || []).map(function (r) {
+            return String(r).toLowerCase();
+        });
+        if (roles.indexOf('admin') !== -1) return 'administrator';
+        if (roles.indexOf('root_admin') !== -1) return 'administrator';
+        if (roles.indexOf('teacher') !== -1) return 'instructor';
+        if (roles.indexOf('ta') !== -1) return 'instructor';
+        if (roles.indexOf('designer') !== -1) return 'instructor';
+        return 'student';
+    }
+
+    function parseCourseId(s) {
+        // context_asset_string looks like "course_3" or "user_1"; we want 3.
+        var m = (s || '').match(/^course_(\d+)$/);
+        return m ? parseInt(m[1], 10) : null;
+    }
+
+    // ---------- Candidate detection ----------
+
+    var PROCESSED = 'data-bifrost-decorated';
+    var CHIP_MARKER = 'data-bifrost-chip-for';
+    // Set on a link whose Converting… or Failed chip should be asked about again.
+    var RECHECK = 'data-bifrost-recheck';
+
+    // Course scoping: when an institution switches a course off (Course access
+    // panel) batch-status says so, and the native Canvas entry points to the
+    // Bifrost tool (course navigation tab, Files per-file menu item) are hidden.
+    // Display-level only: the launch itself is refused server-side.
+    var SCOPE_HIDDEN = 'data-bifrost-scope-hidden';
+    var courseOff = false;
+    var scopeToolId = null;
+    var toolIdPromise = null;
+    var menuObserver = null;
+    var scopeProbeSent = false;
+    var COURSE_MEMO_TTL_MS = 60 * 1000;      // matches the server's decision cache
+    var TOOL_MISS_TTL_MS = 5 * 60 * 1000;    // a failed discovery costs two Canvas list calls
+
+    // Supported media types. PDF is the original case; video adds .mp4 /
+    // .mov / .webm etc — drives the tier-selector tutor flow.
+    var PDF_EXT_RE = /\.pdf(\?|#|$)/i;
+    var PDF_TEXT_RE = /\.pdf\s*$/i;
+    var PDF_WORD_RE = /\.pdf\b/i;
+    var VIDEO_EXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg)(\?|#|$)/i;
+    var VIDEO_TEXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg)\s*$/i;
+    var VIDEO_WORD_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpeg|mpg)\b/i;
+    // Audio extensions. Whisper handles all of these natively after
+    // ffmpeg's 16kHz mono normalisation in the audio pipeline.
+    var AUDIO_EXT_RE = /\.(mp3|m4a|wav|ogg|aac|flac)(\?|#|$)/i;
+    var AUDIO_TEXT_RE = /\.(mp3|m4a|wav|ogg|aac|flac)\s*$/i;
+    var AUDIO_WORD_RE = /\.(mp3|m4a|wav|ogg|aac|flac)\b/i;
+    // Office/spreadsheet documents (PowerPoint/Word/Excel + legacy). They ride
+    // the DOCUMENT pipeline (converted via v2/Datalab), so they classify as
+    // 'pdf' here — the chip offers "Make accessible" and the server resolves the
+    // real format from the file's own name at convert time.
+    var OFFICE_EXT_RE = /\.(pptx?|docx?|xlsx?)(\?|#|$)/i;
+    var OFFICE_TEXT_RE = /\.(pptx?|docx?|xlsx?)\s*$/i;
+    var OFFICE_WORD_RE = /\.(pptx?|docx?|xlsx?)\b/i;
+
+    /** Returns 'pdf' | 'video' | 'audio' | null. */
+    function classifyFileLink(a) {
+        var href = a.getAttribute('href') || '';
+        // Canvas file URLs (Files view + RTE-embedded):
+        //   /courses/<cid>/files/<fid>           — link to file in course
+        //   /courses/<cid>/files/<fid>?download
+        //   /files/<fid>                         — global files
+        //   /files/<fid>/download
+        if (/\/files\/\d+/.test(href)) {
+            // Classify by EVERY filename-bearing signal Canvas exposes, not
+            // just the visible text. An RCE-embedded file link carries the
+            // filename in its `title` (e.g. title="reading.pdf") and often
+            // its aria-label even when the author gave the anchor custom
+            // link text ("this week's reading") — so text alone misses real
+            // embedded links. `instructure_file_link` confirms it's a file
+            // link but not the type, so the extension still has to come from
+            // text/title/aria. Mirrors the module-item branch below.
+            var labels = [
+                (a.textContent || '').trim(),
+                a.getAttribute('title') || '',
+                a.getAttribute('aria-label') || ''
+            ];
+            var anyLabel = function (textRe, wordRe) {
+                for (var i = 0; i < labels.length; i++) {
+                    if (textRe.test(labels[i]) || wordRe.test(labels[i])) return true;
+                }
+                return false;
+            };
+            if (PDF_EXT_RE.test(href)   || anyLabel(PDF_TEXT_RE, PDF_WORD_RE))     return 'pdf';
+            if (VIDEO_EXT_RE.test(href) || anyLabel(VIDEO_TEXT_RE, VIDEO_WORD_RE)) return 'video';
+            if (AUDIO_EXT_RE.test(href) || anyLabel(AUDIO_TEXT_RE, AUDIO_WORD_RE)) return 'audio';
+            if (OFFICE_EXT_RE.test(href) || anyLabel(OFFICE_TEXT_RE, OFFICE_WORD_RE)) return 'pdf';
+            return null;
+        }
+
+        // Modules view module-item links:
+        //   <li class="context_module_item attachment ...">
+        //     <a class="ig-title title item_link" href="/courses/<cid>/modules/items/<mid>">
+        // The extension is unreliable across attributes:
+        //   - <a title="..."> may be stripped.
+        //   - data-module-item-name / data-publish-title same.
+        //   - The publish button's aria-label always includes the full
+        //     filename with extension: "<filename>.pdf is Published".
+        // Try every candidate attribute and accept if any of them matches.
+        var li = a.closest('li.context_module_item.attachment');
+        if (!li) return null;
+        var candidates = [];
+        var pushAttr = function (sel, attr) {
+            var el = li.querySelector(sel);
+            if (el) candidates.push(el.getAttribute(attr) || '');
+        };
+        pushAttr('[data-module-item-name]', 'data-module-item-name');
+        pushAttr('[data-publish-title]',    'data-publish-title');
+        pushAttr('.publish-icon button[aria-label]', 'aria-label');
+        pushAttr('.title.locked_title', 'title');
+        candidates.push((a.getAttribute('title') || ''));
+        for (var i = 0; i < candidates.length; i++) {
+            if (PDF_WORD_RE.test(candidates[i])) return 'pdf';
+            if (VIDEO_WORD_RE.test(candidates[i])) return 'video';
+            if (AUDIO_WORD_RE.test(candidates[i])) return 'audio';
+            if (OFFICE_WORD_RE.test(candidates[i])) return 'pdf';
+        }
+        // No signal fired (renamed module item, or the teacher-only
+        // publish-title / publish-icon attributes aren't in this DOM). Still a
+        // file attachment row, so it stays a candidate — but as 'unknown', NOT
+        // a fake 'pdf': batch-status resolves the real type server-side (doc
+        // row, or the Canvas Files API for staff) and renderChips overrides
+        // cand.mediaType from the server before any URL is built.
+        return 'unknown';
+    }
+
+    function extractFileId(a) {
+        // Direct /files/<id> path.
+        var m = (a.getAttribute('href') || '').match(/\/files\/(\d+)/);
+        if (m) return parseInt(m[1], 10);
+
+        // Module-item path.
+        var li = a.closest('li.context_module_item.attachment');
+        if (li) {
+            // Teacher/admin DOM: file_id is on data-content-id of the
+            // publish-icon (or any data-content-id-bearing span). Absent for
+            // students, who don't get the publish/edit controls.
+            var contentEl = li.querySelector('[data-module-type="attachment"][data-content-id]');
+            if (contentEl) {
+                var fid = parseInt(contentEl.getAttribute('data-content-id'), 10);
+                if (!isNaN(fid) && fid > 0) return fid;
+            }
+            // Student DOM: Canvas stamps "<ContentType>_<content_id>" on the
+            // <li> class, e.g. "... attachment ... Attachment_25 ...". This is
+            // role-agnostic (present in the student view) and is the ONLY
+            // file-id signal a student gets on the Modules page.
+            var cm = (li.className || '').match(/\bAttachment_(\d+)\b/);
+            if (cm) {
+                var cfid = parseInt(cm[1], 10);
+                if (!isNaN(cfid) && cfid > 0) return cfid;
+            }
+        }
+        return null;
+    }
+
+    // Stable key — survives Canvas's re-render of module-item rows.
+    function candKey(c) { return 'f:' + c.file_id; }
+
+    function collectCandidates(root) {
+        var out = [];
+        var seen = {};
+        var anchors = (root || document).querySelectorAll('a[href]');
+        for (var i = 0; i < anchors.length; i++) {
+            var a = anchors[i];
+            if (a.hasAttribute(PROCESSED)) continue;
+            // A chip may sit on EITHER side of the link (admin position
+            // setting), so check both siblings — otherwise a "before" chip
+            // is missed here and re-injected on every observer pass. A link
+            // marked RECHECK is asked about again even though it has a chip.
+            var nextSib = a.nextElementSibling;
+            var prevSib = a.previousElementSibling;
+            if (!a.hasAttribute(RECHECK)
+                && ((nextSib && nextSib.getAttribute && nextSib.getAttribute(CHIP_MARKER))
+                    || (prevSib && prevSib.getAttribute && prevSib.getAttribute(CHIP_MARKER)))) {
+                a.setAttribute(PROCESSED, 'already');
+                continue;
+            }
+            var mediaType = classifyFileLink(a);
+            if (!mediaType) continue;
+            var fid = extractFileId(a);
+            if (!fid) continue;
+
+            // Build a canonicalised fileurl that title2-api can use as a
+            // stable key. Canvas exposes the file at /files/<id>/download
+            // for direct binary access; that URL is also what
+            // /v1/accessible/resolve will redirect to.
+            var fileurl = location.origin + '/files/' + fid + '/download';
+            var key = 'f:' + fid;
+            if (seen[key]) continue;
+            seen[key] = 1;
+
+            a.setAttribute(PROCESSED, 'pending');
+            out.push({
+                id:        'a' + out.length,
+                kind:      'fileurl',
+                file_id:   fid,
+                fileurl:   fileurl,
+                mediaType: mediaType
+            });
+        }
+        return out;
+    }
+
+    function findLiveAnchor(cand) {
+        var anchors = document.querySelectorAll('a[href]');
+        for (var i = 0; i < anchors.length; i++) {
+            var fid = extractFileId(anchors[i]);
+            if (fid === cand.file_id) return anchors[i];
+        }
+        return null;
+    }
+
+    // ---------- Remilo mark (path verbatim from public/brand/remilo-icon.svg) ----------
+    // The Remilo emblem as one path with no fill of its own, so the per-variant
+    // `fill: currentColor` CSS below colours it from the chip's Stitch icon
+    // token, the same way it colours the label. The viewBox is square; the
+    // chip icon CSS sizes it by height (`.stitch-button-small svg`).
+    var REMILO_EMBLEM_D = 'M106.667 32.8164C98.5352 12.8591 76.6374 0 53.3333 0H0V53.3333H66.6667L0 120L40 160L106.667 93.3333V160H160V106.667C160 83.3632 147.142 61.4642 127.184 53.3333H160V0H106.667V32.8164Z';
+
+    function remiloMark() {
+        var svgns = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(svgns, 'svg');
+        svg.setAttribute('width', '16');
+        svg.setAttribute('height', '16');
+        svg.setAttribute('viewBox', '0 0 160 160');
+        svg.setAttribute('aria-hidden', 'true');
+        var p = document.createElementNS(svgns, 'path');
+        p.setAttribute('d', REMILO_EMBLEM_D);
+        // currentColor here too, so the mark still follows the label colour
+        // where no shadow root (and so no chip stylesheet) is available.
+        p.setAttribute('fill', 'currentColor');
+        svg.appendChild(p);
+        return svg;
+    }
+
+    // ---------- Chip rendering (Shadow DOM + Stitch tokens) ----------
+    //
+    // Identical to local_title2's chip implementation — same Shadow root,
+    // same imported Tailo dark tokens, same Stitch button class names.
+    // The chip is decoupled from Canvas's CSS (which is more aggressive
+    // than Moodle's about overriding `a` colour) by living inside the
+    // shadow root.
+
+    // One entry per chip state. Every aria-label names the file so a screen
+    // reader user hears which link the chip belongs to.
+    var VARIANTS = {
+        accessible: {
+            stitchKind: 'primary',
+            label: function () { return 'Accessible version'; },
+            aria: function (o) { return 'Open the accessible version of ' + o.filename; }
+        },
+        fix: {
+            stitchKind: 'secondary',
+            label: function (o) { return 'Fix ' + issuesText(o.issueCount); },
+            aria: function (o) { return 'Fix ' + issuesText(o.issueCount) + ' in ' + o.filename; }
+        },
+        make: {
+            stitchKind: 'secondary',
+            label: function () { return 'Make accessible'; },
+            aria: function (o) { return 'Make ' + o.filename + ' accessible in Remilo'; }
+        },
+        // Not a link: there is nothing to open until the conversion lands.
+        converting: {
+            stitchKind: 'secondary',
+            loading: true,
+            label: function () { return 'Converting…'; },
+            aria: function (o) { return 'Converting ' + o.filename + ' to an accessible version'; }
+        },
+        failed: {
+            stitchKind: 'secondary',
+            label: function () { return 'Failed — Retry conversion'; },
+            aria: function (o) { return 'Conversion of ' + o.filename + ' failed. Retry conversion'; }
+        }
+    };
+
+    function issuesText(n) {
+        return n + (n === 1 ? ' accessibility issue' : ' accessibility issues');
+    }
+
+    // Stitch's Loader (Atoms/Loader) in currentColor, so the chip's text token
+    // colours it. Gradient ids only need to be unique inside one shadow root.
+    function loadingSpinner() {
+        var svgns = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(svgns, 'svg');
+        svg.setAttribute('width', '16');
+        svg.setAttribute('height', '16');
+        svg.setAttribute('viewBox', '-20 -20 240 240');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.setAttribute('class', 'spinner');
+        var defs = document.createElementNS(svgns, 'defs');
+        var stops = {
+            'spinner-secondHalf': [['0%', '0'], ['100%', '0.5']],
+            'spinner-firstHalf': [['0%', '1'], ['100%', '0.5']]
+        };
+        Object.keys(stops).forEach(function (id) {
+            var grad = document.createElementNS(svgns, 'linearGradient');
+            grad.setAttribute('id', id);
+            stops[id].forEach(function (s) {
+                var stop = document.createElementNS(svgns, 'stop');
+                stop.setAttribute('offset', s[0]);
+                stop.setAttribute('stop-opacity', s[1]);
+                stop.setAttribute('stop-color', 'currentColor');
+                grad.appendChild(stop);
+            });
+            defs.appendChild(grad);
+        });
+        svg.appendChild(defs);
+        var g = document.createElementNS(svgns, 'g');
+        g.setAttribute('stroke-width', '20');
+        [['url(#spinner-secondHalf)', 'M 4 100 A 96 96 0 0 1 196 100'],
+         ['url(#spinner-firstHalf)', 'M 196 100 A 96 96 0 0 1 4 100']].forEach(function (p) {
+            var path = document.createElementNS(svgns, 'path');
+            path.setAttribute('stroke', p[0]);
+            path.setAttribute('d', p[1]);
+            g.appendChild(path);
+        });
+        var spin = document.createElementNS(svgns, 'animateTransform');
+        spin.setAttribute('attributeName', 'transform');
+        spin.setAttribute('type', 'rotate');
+        spin.setAttribute('from', '0 100 100');
+        spin.setAttribute('to', '360 100 100');
+        spin.setAttribute('dur', '1300ms');
+        spin.setAttribute('repeatCount', 'indefinite');
+        g.appendChild(spin);
+        svg.appendChild(g);
+        return svg;
+    }
+
+    function makeChip(variantKey, href, candKeyStr, inlineLaunch, opts) {
+        var v = VARIANTS[variantKey];
+        opts = opts || {};
+        // Admin-set chip appearance (arrives on the batch-status `platform`
+        // object). position: 'before' | 'after' (default) the file link;
+        // style: 'icon' | 'full' (default = icon + text label).
+        var position = opts.position === 'before' ? 'before' : 'after';
+        // NB: named `iconOnly`, NOT `style` — makeChip already has a
+        // `var style = document.createElement('style')` for the shadow CSS,
+        // and `var` hoisting would clobber a same-named chip-style flag.
+        var iconOnly = opts.style === 'icon';
+        var host = document.createElement('span');
+        host.setAttribute('data-bifrost-chip', variantKey);
+        host.setAttribute(CHIP_MARKER, candKeyStr);
+        host.style.cssText = [
+            'display:inline-block',
+            // Gap on the side facing the link, so spacing is symmetric
+            // whether the chip precedes or follows the anchor.
+            position === 'before' ? 'margin-right:8px' : 'margin-left:8px',
+            'vertical-align:middle',
+            'position:relative', 'z-index:2', 'pointer-events:auto', 'line-height:0'
+        ].join(';');
+
+        var shadow = (typeof host.attachShadow === 'function')
+            ? host.attachShadow({ mode: 'open' }) : null;
+        adoptTokens(shadow);
+        var btnClass = 'stitch-button stitch-button-small stitch-button-' + v.stitchKind
+            + (v.loading ? ' stitch-button-disabled stitch-button-loading' : '');
+
+        if (shadow) {
+            var style = document.createElement('style');
+            style.textContent = [
+                tokensImportRule(),
+                "@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600&display=swap');",
+                ':host { display: inline-block; }',
+                '.stitch-button {',
+                '  position: relative; display: inline-flex; align-items: center; justify-content: center;',
+                '  gap: 0.5rem; font-family: "Poppins", system-ui, sans-serif; font-weight: 600;',
+                '  line-height: 1em; border-radius: calc(infinity * 1px); border: 2px solid transparent;',
+                '  text-decoration: none; cursor: pointer; white-space: nowrap;',
+                '  transition: border-color 0.2s, background 0.2s, color 0.2s;',
+                '}',
+                'button.stitch-button { margin: 0; }',
+                '.stitch-button-small { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }',
+                '.stitch-button-small svg { height: 0.95rem; width: auto; flex-shrink: 0; }',
+                '.stitch-button-primary {',
+                '  border-color: var(--component-button-primary-border-default);',
+                '  background: var(--component-button-primary-background-default);',
+                '  color: var(--component-button-primary-foreground-text-default);',
+                '}',
+                '.stitch-button-primary svg { color: var(--component-button-primary-foreground-icon-default); fill: currentColor; }',
+                '.stitch-button-primary:hover {',
+                '  border-color: var(--component-button-primary-border-hover);',
+                '  background: var(--component-button-primary-background-hover);',
+                '  color: var(--component-button-primary-foreground-text-hover);',
+                '}',
+                '.stitch-button-secondary {',
+                '  border-color: var(--component-button-secondary-border-default);',
+                '  background: var(--component-button-secondary-background-default);',
+                '  color: var(--component-button-secondary-foreground-text-default);',
+                '}',
+                '.stitch-button-secondary svg { color: var(--component-button-secondary-foreground-icon-default); fill: currentColor; }',
+                '.stitch-button-secondary:not(.stitch-button-disabled):hover {',
+                '  border-color: var(--component-button-secondary-border-hover);',
+                '  background: var(--component-button-secondary-background-hover);',
+                '  color: var(--component-button-secondary-foreground-text-hover);',
+                '}',
+                // Stitch's disabled secondary; a loading button always carries it.
+                '.stitch-button-secondary.stitch-button-disabled {',
+                '  border-color: var(--component-button-secondary-border-disabled);',
+                '  background: var(--component-button-secondary-background-disabled);',
+                '  color: var(--component-button-secondary-foreground-text-disabled);',
+                '}',
+                '.stitch-button-secondary.stitch-button-disabled svg { color: var(--component-button-secondary-foreground-text-disabled); }',
+                '.stitch-button.stitch-button-disabled.stitch-button-loading { cursor: progress; }',
+                // The spinner strokes in currentColor and must not be filled.
+                '.stitch-button svg.spinner { fill: none; }',
+                '.stitch-button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring-focus); }'
+            ].join('\n');
+            shadow.appendChild(style);
+        }
+
+        var label = v.label(opts);
+        var a;
+        if (v.loading) {
+            // aria-disabled, not disabled, so keyboard users still reach and hear it.
+            a = document.createElement('button');
+            a.type = 'button';
+            a.setAttribute('aria-disabled', 'true');
+            a.setAttribute('aria-busy', 'true');
+            a.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        } else {
+            a = document.createElement('a');
+            a.href = href;
+            if (!inlineLaunch) {
+                // A new tab, so the user keeps their place in the course.
+                a.target = '_blank';
+                a.rel = 'noopener';
+            } else {
+                // inlineLaunch chips navigate Canvas itself so the LMS re-launches
+                // our LTI tool inline via its iframe (see buildMakeAccessibleUrl
+                // for the external_tools/retrieve URL).
+                //
+                // Canvas's Files / Modules pages have row-level click handlers
+                // (a React onClick on a parent calls window.open(file.url,
+                // '_blank') for "preview"), so a plain anchor's native nav races
+                // Canvas's handler and loses. Two-part fix:
+                //   1. Stop click bubbling so Canvas never sees the event.
+                //   2. Force `_top` navigation, in case the chip sits inside a
+                //      Canvas iframe (RCE preview, Studio embed) where `_self`
+                //      would only navigate the iframe.
+                a.target = '_top';
+                a.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    // Modifier-clicks (cmd/ctrl/shift) keep their native semantics.
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                    e.preventDefault();
+                    try {
+                        window.top.location.assign(href);
+                    } catch (_) {
+                        // A cross-origin ancestor can block top access.
+                        window.location.assign(href);
+                    }
+                });
+            }
+        }
+        a.setAttribute('aria-label', v.aria(opts));
+        a.className = btnClass;
+        a.appendChild(v.loading ? loadingSpinner() : remiloMark());
+        // Icon-only mode drops the visible text label; the aria-label above
+        // keeps the control accessible, and the tooltip shows it on hover.
+        if (iconOnly) {
+            a.title = label;
+        } else {
+            a.appendChild(document.createTextNode(label));
+        }
+        // "Fix n" opens the convert pop-up instead of navigating; modifier
+        // clicks keep their native open-in-tab semantics on the href.
+        if (opts.onActivate) {
+            a.addEventListener('click', function (e) {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                e.stopPropagation();
+                opts.onActivate(a);
+            });
+        }
+        (shadow || host).appendChild(a);
+        return host;
+    }
+
+    // ---------- Convert pop-up (staff only) ----------
+    //
+    // The "Fix n" chip (batch-status sends `issue_count` only to resolved
+    // tutors/admins) opens this pop-up instead of navigating. "Convert now"
+    // carries &auto=convert so the tutor screen starts the conversion unaided;
+    // "Manage content" is the chip's plain launch.
+    //
+    // A copy of Stitch's Modal (Molecules/Modal), which this page cannot mount
+    // without React: a native <dialog> via showModal(), with the header, body
+    // and footer styles from its styles.css. `closedby="closerequest"` follows
+    // the repo rule that a click outside does not dismiss a modal.
+    var MODAL_HOST_ID = 'bifrost-convert-modal-host';
+
+    // Stitch's xmark icon (FontAwesome regular).
+    var XMARK_D = 'M7.5 105c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l151 151 151-151c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9l-151 151 151 151c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-151-151-151 151c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l151-151-151-151z';
+
+    function xmarkIcon() {
+        var svgns = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(svgns, 'svg');
+        svg.setAttribute('viewBox', '0 0 384 512');
+        svg.setAttribute('aria-hidden', 'true');
+        var p = document.createElementNS(svgns, 'path');
+        p.setAttribute('d', XMARK_D);
+        p.setAttribute('fill', 'currentColor');
+        svg.appendChild(p);
+        return svg;
+    }
+
+    function closeConvertModal() {
+        var host = document.getElementById(MODAL_HOST_ID);
+        if (!host) return;
+        var dialog = host.shadowRoot && host.shadowRoot.querySelector('dialog');
+        // Closing fires the dialog's close event, which removes the host.
+        if (dialog && dialog.open) {
+            dialog.close();
+        } else if (host.parentNode) {
+            host.parentNode.removeChild(host);
+        }
+    }
+
+    function openConvertModal(filename, issueCount, convertHref, manageHref, openerEl) {
+        closeConvertModal();
+        var host = document.createElement('div');
+        host.id = MODAL_HOST_ID;
+        var shadow = (typeof host.attachShadow === 'function')
+            ? host.attachShadow({ mode: 'open' }) : null;
+        // No shadow root: the page's CSS would restyle the dialog, so navigate.
+        if (!shadow) {
+            window.open(manageHref, '_blank', 'noopener');
+            return;
+        }
+
+        var style = document.createElement('style');
+        adoptTokens(shadow);
+        style.textContent = [
+            tokensImportRule(),
+            "@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap');",
+            // Stitch Modal (styles.css).
+            '.stitch-modal {',
+            '  width: min(40rem, calc(100% - 2rem)); max-height: min(85dvh, calc(100% - 2rem));',
+            '  padding: 0; border: 2px solid var(--border-muted-2); border-radius: 2rem;',
+            '  background: var(--surface-content); color: var(--text-default);',
+            '  overflow: auto; display: flex; flex-direction: column; align-items: stretch;',
+            '  font-family: "Poppins", system-ui, sans-serif;',
+            '}',
+            '.stitch-modal:not([open]) { display: none; }',
+            '.stitch-modal::backdrop {',
+            '  background: rgba(0, 0, 0, 0.5);',
+            '  background: color-mix(in srgb, var(--surface-overlay) 60%, transparent);',
+            '}',
+            '.stitch-modal-header {',
+            '  display: flex; justify-content: space-between; align-items: center;',
+            '  background-color: var(--surface-content); border-bottom: 2px solid var(--border-muted-3);',
+            '  padding: 0.75rem 1.75rem;',
+            '}',
+            '.stitch-modal-header-content { display: flex; flex-direction: column; align-items: start; gap: 0.5rem; min-width: 0; }',
+            '.stitch-modal-title { margin: 0; font-size: 1rem; line-height: 1.5rem; font-weight: 600; word-break: break-word; }',
+            '.stitch-modal-body {',
+            '  flex: 1 1 auto; min-height: 0; overflow: auto; padding: 2rem;',
+            '  background-color: var(--surface-base);',
+            '}',
+            '.stitch-modal-footer { display: flex; gap: 1rem; padding: 0.5rem; border-top: 2px solid var(--border-muted-3); }',
+            '.stitch-modal-footer > * { flex: 1 1 0; }',
+            '@media (prefers-reduced-motion: no-preference) {',
+            '  .stitch-modal, .stitch-modal::backdrop { transition: opacity 0.15s ease, transform 0.15s ease; }',
+            '  @starting-style { .stitch-modal[open] { opacity: 0; transform: scale(0.96); } .stitch-modal[open]::backdrop { opacity: 0; } }',
+            '}',
+            // The body copy, as the tutor screen's ErrorModal sets it.
+            '.convert-modal-heading { margin: 0; font-size: 1.5rem; font-weight: 600; line-height: 1.4; color: var(--text-default); }',
+            '.convert-modal-copy { margin: 0.5rem 0 0; font-size: 1rem; line-height: 1.5; color: var(--text-muted-2); }',
+            // Stitch Button (button.css).
+            '.stitch-button {',
+            '  position: relative; display: flex; align-items: center; justify-content: center;',
+            '  box-sizing: border-box; font: inherit; font-weight: 600; line-height: 1em;',
+            '  border-radius: calc(infinity * 1px); border: 2px solid transparent;',
+            '  text-decoration: none; cursor: pointer;',
+            '  transition: border-color 0.2s, background 0.2s, color 0.2s;',
+            '}',
+            '.stitch-button-label { padding: 0 0.5rem; height: 1.5rem; display: flex; align-items: center; }',
+            '.stitch-button-medium { padding: 0.75rem; font-size: 1rem; line-height: 1.5rem; }',
+            '.stitch-button-small { padding: 0.5rem; font-size: 1rem; line-height: 1.5rem; }',
+            '.stitch-button-icon { height: 1.5rem; width: 1.5rem; display: flex; align-items: center; justify-content: center; }',
+            '.stitch-button-icon svg { height: 1rem; width: 1rem; }',
+            '.stitch-button-primary { border-color: var(--component-button-primary-border-default);',
+            '  background: var(--component-button-primary-background-default);',
+            '  color: var(--component-button-primary-foreground-text-default); }',
+            '.stitch-button-primary:hover { border-color: var(--component-button-primary-border-hover);',
+            '  background: var(--component-button-primary-background-hover);',
+            '  color: var(--component-button-primary-foreground-text-hover); }',
+            '.stitch-button-primary:focus-visible { border-color: var(--component-button-primary-border-focus); box-shadow: 0 0 0 3px var(--ring-focus); outline: none; }',
+            '.stitch-button-secondary { border-color: var(--component-button-secondary-border-default);',
+            '  background: var(--component-button-secondary-background-default);',
+            '  color: var(--component-button-secondary-foreground-text-default); }',
+            '.stitch-button-secondary:hover { border-color: var(--component-button-secondary-border-hover);',
+            '  background: var(--component-button-secondary-background-hover);',
+            '  color: var(--component-button-secondary-foreground-text-hover); }',
+            '.stitch-button-secondary:focus-visible { border-color: var(--component-button-secondary-border-focus); box-shadow: 0 0 0 3px var(--ring-focus); outline: none; }',
+            '.stitch-button-tertiary { border-color: var(--component-button-tertiary-border-default);',
+            '  background: var(--component-button-tertiary-background-default);',
+            '  color: var(--component-button-tertiary-foreground-text-default); }',
+            '.stitch-button-tertiary:hover { border-color: var(--component-button-tertiary-border-hover);',
+            '  background: var(--component-button-tertiary-background-hover);',
+            '  color: var(--component-button-tertiary-foreground-text-hover); }',
+            '.stitch-button-tertiary:focus-visible { border-color: var(--component-button-tertiary-border-focus); box-shadow: 0 0 0 3px var(--ring-focus); outline: none; }'
+        ].join('\n');
+        shadow.appendChild(style);
+
+        var titleId = 'bifrost-convert-modal-title';
+        var headingId = 'bifrost-convert-modal-heading';
+        var copyId = 'bifrost-convert-modal-copy';
+
+        var dialog = document.createElement('dialog');
+        dialog.className = 'stitch-modal';
+        dialog.setAttribute('closedby', 'closerequest');
+        dialog.setAttribute('aria-labelledby', headingId + ' ' + titleId);
+        dialog.setAttribute('aria-describedby', copyId);
+
+        // Header: the file name (Stitch's ModalTitle is an h4) and the X.
+        var header = document.createElement('div');
+        header.className = 'stitch-modal-header';
+        var headerContent = document.createElement('div');
+        headerContent.className = 'stitch-modal-header-content';
+        var title = document.createElement('h4');
+        title.className = 'stitch-modal-title';
+        title.id = titleId;
+        title.textContent = filename;
+        headerContent.appendChild(title);
+        header.appendChild(headerContent);
+        var closeX = document.createElement('button');
+        closeX.type = 'button';
+        closeX.className = 'stitch-button stitch-button-small stitch-button-tertiary stitch-button-icon-only';
+        closeX.setAttribute('aria-label', 'Close');
+        var xIcon = document.createElement('span');
+        xIcon.className = 'stitch-button-icon';
+        xIcon.appendChild(xmarkIcon());
+        closeX.appendChild(xIcon);
+        closeX.addEventListener('click', function () { dialog.close(); });
+        header.appendChild(closeX);
+        dialog.appendChild(header);
+
+        var body = document.createElement('div');
+        body.className = 'stitch-modal-body';
+        var heading = document.createElement('h5');
+        heading.className = 'convert-modal-heading';
+        heading.id = headingId;
+        heading.textContent = 'Fix ' + issuesText(issueCount);
+        body.appendChild(heading);
+        var copy = document.createElement('p');
+        copy.className = 'convert-modal-copy';
+        copy.id = copyId;
+        copy.textContent = 'Remilo found ' + issuesText(issueCount) + ' in the original. '
+            + 'Converting produces a tagged, screen-reader-ready version and fixes what '
+            + 'can be fixed automatically.';
+        body.appendChild(copy);
+        dialog.appendChild(body);
+
+        // A placement URL (iframe chip mode) navigates Canvas itself so the
+        // tool embeds; anything else keeps the new-tab behaviour.
+        function footerLink(variant, label, href) {
+            var a2 = document.createElement('a');
+            a2.className = 'stitch-button stitch-button-medium stitch-button-' + variant;
+            a2.href = href;
+            var span = document.createElement('span');
+            span.className = 'stitch-button-label';
+            span.textContent = label;
+            a2.appendChild(span);
+            if (href.indexOf(location.origin + '/courses/') === 0) {
+                a2.target = '_top';
+                a2.addEventListener('click', function (e) {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                    e.preventDefault();
+                    dialog.close();
+                    try { window.top.location.assign(href); }
+                    catch (_) { window.location.assign(href); }
+                });
+            } else {
+                a2.target = '_blank';
+                a2.rel = 'noopener';
+                a2.addEventListener('click', function () { dialog.close(); });
+            }
+            return a2;
+        }
+
+        var footer = document.createElement('div');
+        footer.className = 'stitch-modal-footer';
+        footer.appendChild(footerLink('secondary', 'Manage content', manageHref));
+        var convert = footerLink('primary', 'Convert now', convertHref);
+        footer.appendChild(convert);
+        dialog.appendChild(footer);
+
+        // Every close (X, Escape, an action) lands here.
+        dialog.addEventListener('close', function () {
+            if (host.parentNode) host.parentNode.removeChild(host);
+            if (openerEl && typeof openerEl.focus === 'function') {
+                try { openerEl.focus(); } catch (_) {}
+            }
+        });
+
+        shadow.appendChild(dialog);
+        document.body.appendChild(host);
+        dialog.showModal();
+        convert.focus();
+    }
+
+    // ---------- URL builders ----------
+
+    function buildAccessibleUrl(cfg, cand) {
+        // `course` is passed so /v1/accessible/resolve can fall back
+        // to Canvas's LTI re-launch URL when the user has no
+        // title2_session cookie yet (e.g. first chip click in a
+        // fresh tab, before any course-nav launch has primed the
+        // cookie). Matches the same auto-recovery /v1/handoff uses
+        // for the "Make accessible" chip.
+        //
+        // Viewer-hint params (`vcu`, `vh`): when the user has no
+        // live title2_session cookie, /v1/accessible/resolve uses
+        // these to look up the LtiUser DB row by
+        // (platform_id, canvas_user_id) and mint a fresh session
+        // for the chip flow — survives the 2h instructor cookie TTL
+        // without requiring the user to first navigate to the
+        // Bifrost admin dashboard. Mirrors the same change in the
+        // Moodle decorator; same params batch-status uses.
+        var hintQs = '';
+        if (cfg.canvasUserId) {
+            hintQs += '&vcu=' + encodeURIComponent(cfg.canvasUserId);
+        }
+        if (cfg.roleHint) {
+            hintQs += '&vh=' + encodeURIComponent(cfg.roleHint);
+        }
+        return cfg.apiurl + '/v1/accessible/resolve'
+            + '?i=' + encodeURIComponent(cfg.issuer)
+            + '&u=' + encodeURIComponent(cand.fileurl)
+            + (cfg.courseid ? '&course=' + encodeURIComponent(cfg.courseid) : '')
+            + hintQs;
+    }
+
+    // "Make accessible" — two flavours, picked by the platform's
+    // `chip_launch_target` setting (admin-configurable on /admin):
+    //
+    // 1. tab (default, works everywhere): chip is a plain link to
+    //    title2-api's /v1/handoff cookie-handoff endpoint. Opens in a
+    //    new tab; user lands on bifrost.tailoapp.com/lti/tutor as a
+    //    top-level navigation. Same flow we've shipped since Phase 3.
+    //
+    // 2. iframe (Canvas-only opt-in): chip points at Canvas's
+    //    `external_tools/retrieve?url=<launch>&display=borderless`,
+    //    which matches our tool by URL and embeds the relaunched LTI
+    //    tool inline inside Canvas's iframe. Requires the tool's
+    //    `link_selection` placement to have `windowTarget: '_self'`
+    //    (set in register-lti-tool.rb + applied at boot). Moodle's
+    //    stock launcher can't do this — iframe mode is silently
+    //    ignored on Moodle and falls back to tab.
+    //
+    // Both flavours preserve preselect data (file_id + fileurl) so
+    // the tutor screen lands on the user's intended PDF.
+    function buildMakeAccessibleUrlTab(cfg, cand, auto) {
+        // Cookie-handoff path: /v1/handoff prefers the title2_session
+        // cookie when present. Viewer-hint params (`vcu`, `vh`) let
+        // the handler mint a fresh session via the
+        // (platform_id, canvas_user_id) → LtiUser DB lookup when the
+        // cookie is missing — same pattern /v1/accessible/resolve
+        // uses. Without these, the cookieless fallback redirects the
+        // user to Canvas's external_tools/N relaunch URL, which
+        // fails with "Couldn't find valid settings for this tool"
+        // until the user has launched the tool in the course at
+        // least once.
+        var hintQs = '';
+        if (cfg.canvasUserId) {
+            hintQs += '&vcu=' + encodeURIComponent(cfg.canvasUserId);
+        }
+        if (cfg.roleHint) {
+            hintQs += '&vh=' + encodeURIComponent(cfg.roleHint);
+        }
+        return cfg.apiurl + '/v1/handoff'
+            + '?iss='     + encodeURIComponent(cfg.issuer)
+            + '&fileurl=' + encodeURIComponent(cand.fileurl)
+            + '&file_id=' + encodeURIComponent(cand.file_id)
+            + (cfg.courseid ? '&course=' + encodeURIComponent(cfg.courseid) : '')
+            + (cand.mediaType === 'video' ? '&kind=video' : cand.mediaType === 'audio' ? '&kind=audio' : '')
+            + hintQs
+            + (auto ? '&auto=convert' : '')
+            + '&via=canvas-chip';
+    }
+
+    // Iframe mode = Canvas's `external_tools/retrieve?url=<launch>` pattern.
+    // Canvas matches the tool by the url's DOMAIN (our API host, the tool's
+    // registered domain) via Lti::ToolFinder.from_url, runs a real LTI 1.3
+    // launch to that url, and RENDERS IT EMBEDDED in a Canvas page (verified
+    // against canvas-lms external_tools_controller#retrieve — it renders the
+    // launch template, it does not redirect). No numeric tool_id needed, so
+    // no `/v1/canvas/tool-id` lookup and none of the "Couldn't find valid
+    // settings for this tool" failures that the `external_tools/<id>?
+    // launch_type=` (show action) hit when the id/placement doesn't resolve
+    // in the course context.
+    //
+    // Our per-chip params (placement, file_id, fileurl, auto) ride the url's
+    // OWN query string; Canvas carries the whole url into the launch's
+    // target_link_uri CLAIM, and launch.ts reads them from there. (Canvas
+    // does NOT merge external_tools/retrieve?custom_*= reliably — query on
+    // the url is the tested-reliable channel.)
+    function retrieveEmbedUrl(cfg, launchQuery) {
+        if (!cfg.courseid) return null;
+        var launchUrl = cfg.apiurl + '/lti/launch?' + launchQuery;
+        // NO `display=borderless`. Canvas's display templates
+        // (lib/lti/app_util.rb): borderless -> `unframed_launch` (the
+        // launch IS the whole page, so our /lti/launch 302 to the SPA
+        // takes the FULL WINDOW — the "opens full page, not embedded"
+        // bug). Omitting display uses the tool's display_type, which for
+        // a nil placement is `in_context` -> `framed_launch`: the tool
+        // renders in an IFRAME inside the Canvas course page, so our
+        // redirect stays embedded — matching the course-nav / file-menu
+        // launch. (Verified against canvas-lms external_tools_controller
+        // #retrieve + ContextExternalTool#display_type.)
+        return location.origin
+            + '/courses/' + encodeURIComponent(cfg.courseid)
+            + '/external_tools/retrieve'
+            + '?url=' + encodeURIComponent(launchUrl);
+    }
+
+    function kindParam(cand) {
+        return cand.mediaType === 'video' ? '&kind=video'
+             : cand.mediaType === 'audio' ? '&kind=audio' : '';
+    }
+
+    function buildMakeAccessibleUrlIframe(cfg, cand, auto) {
+        // `auto=convert` MUST ride the LAUNCH query (inside the retrieve `url=`),
+        // not be appended to the outer retrieve URL — Canvas only carries the
+        // launch url into the target_link_uri claim, so an outer &auto= is
+        // dropped (while file_id survives because it's in the launch). That drop
+        // was why "Convert now" preselected the file but never started it.
+        return retrieveEmbedUrl(cfg,
+            'placement=tutor'
+            + '&file_id=' + encodeURIComponent(cand.file_id)
+            + '&fileurl=' + encodeURIComponent(cand.fileurl)
+            + (auto ? '&auto=convert' : '')
+            + kindParam(cand));
+    }
+
+    // "Accessible version" / "Converting…" chips, iframe flavour: same embed,
+    // placement=view — the launch handler hands the fileurl to the resolve
+    // tail (reader / pending / unknown) inside Canvas's embedded tool page.
+    function buildAccessibleUrlIframe(cfg, cand) {
+        return retrieveEmbedUrl(cfg,
+            'placement=view'
+            + '&file_id=' + encodeURIComponent(cand.file_id)
+            + '&fileurl=' + encodeURIComponent(cand.fileurl)
+            + kindParam(cand));
+    }
+
+    // ---------- Server call ----------
+
+    function batchStatus(cfg, candidates) {
+        // viewer_hint: untrusted client hint about who's viewing. Server
+        // looks up the LtiUser by (platform_id, canvas_user_id) and
+        // returns the resolved role + feature_grants in `viewer`, plus
+        // per-item `actions` for the chip renderer. Falls back to
+        // student if the lookup fails — safe default.
+        //
+        // We keep credentials: 'omit' so the request works in 3PC-blocked
+        // browsers (Safari ITP, Brave, etc.). The cookie path inside
+        // batch-status is a nice-to-have when cookies do arrive; the
+        // hint path is the primary source.
+        var payload = {
+            issuer: cfg.issuer,
+            courseid: cfg.courseid || undefined,
+            items: candidates.map(function (c) {
+                // media_type: our extension-based classification, sent only
+                // when a real DOM signal confirmed it — 'unknown' is omitted
+                // so the server resolves the truth (doc row / Canvas Files
+                // API) instead of trusting a guess.
+                return {
+                    id: c.id,
+                    fileurl: c.fileurl,
+                    media_type: c.mediaType === 'unknown' ? undefined : c.mediaType
+                };
+            }),
+            viewer_hint: {
+                canvas_user_id: cfg.canvasUserId,
+                role_hint: cfg.roleHint
+            }
+        };
+        return fetch(cfg.apiurl + '/v1/accessible/batch-status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            credentials: 'omit'
+        }).then(function (res) {
+            if (!res.ok) throw new Error('batch-status HTTP ' + res.status);
+            return res.json();
+        });
+    }
+
+    // ---------- Course scoping (hide native entry points) ----------
+
+    function storageRead(key) {
+        try {
+            var raw = window.sessionStorage.getItem(key);
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) { return null; }
+    }
+
+    function storageWrite(key, value) {
+        try {
+            window.sessionStorage.setItem(key, JSON.stringify(value));
+        } catch (e) { /* storage blocked: fall back to no memo */ }
+    }
+
+    function courseMemoKey(cfg) {
+        return 'bifrost_scope_course:' + cfg.issuer + ':' + cfg.courseid;
+    }
+
+    function toolMemoKey(cfg) {
+        return 'bifrost_scope_tool:' + cfg.issuer;
+    }
+
+    function readCourseMemo(cfg) {
+        var memo = storageRead(courseMemoKey(cfg));
+        if (!memo || typeof memo.enabled !== 'boolean') return null;
+        // `!(age <= TTL)` rather than `age > TTL`: a missing or non-numeric
+        // timestamp gives NaN, and NaN > TTL is false, which would make a
+        // malformed memo immortal.
+        if (typeof memo.t !== 'number' || !(Date.now() - memo.t <= COURSE_MEMO_TTL_MS)) return null;
+        return memo;
+    }
+
+    function positiveToolId(value) {
+        var id = typeof value === 'number' ? value : parseInt(value, 10);
+        return isFinite(id) && id > 0 ? id : null;
+    }
+
+    /** Resolves the Bifrost tool's numeric id on this Canvas: already known,
+     *  else from the batch-status response, else one memoised GET to the
+     *  tool-id route (public; persists the id server-side). Resolves null when
+     *  it cannot be discovered, in which case nothing is hidden. Only called
+     *  on the course-off path. */
+    function ensureToolId(cfg, fromResponse) {
+        if (scopeToolId) return Promise.resolve(scopeToolId);
+        var known = positiveToolId(fromResponse);
+        if (known) return Promise.resolve(known);
+
+        var memo = storageRead(toolMemoKey(cfg));
+        if (memo) {
+            var memoId = positiveToolId(memo.id);
+            if (memoId) return Promise.resolve(memoId);
+            if (Date.now() - memo.t < TOOL_MISS_TTL_MS) return Promise.resolve(null);
+        }
+
+        if (!toolIdPromise) {
+            toolIdPromise = fetch(cfg.apiurl + '/v1/canvas/tool-id?issuer='
+                + encodeURIComponent(cfg.issuer), { credentials: 'omit' })
+                .then(function (res) {
+                    if (!res.ok) {
+                        storageWrite(toolMemoKey(cfg), { t: Date.now(), id: null });
+                        return null;
+                    }
+                    return res.json().then(function (body) {
+                        var id = positiveToolId(body && body.tool_id);
+                        if (id) storageWrite(toolMemoKey(cfg), { t: Date.now(), id: id });
+                        return id;
+                    });
+                })
+                .catch(function () { return null; });
+        }
+        return toolIdPromise;
+    }
+
+    // Matches the tool id as a whole path segment: tool 9 must not match 91.
+    function toolHrefMatcher(id) {
+        var re = new RegExp('/external_tools/' + id + '(?=[/?#]|$)');
+        return function (a) { return re.test(a.getAttribute('href') || ''); };
+    }
+
+    // Inline display:none, not el.hidden: `hidden` is a UA-stylesheet rule that
+    // any author `display` (InstUI classes, Canvas's #section-tabs li) overrides.
+    function hideScopedElement(el) {
+        if (!el || el.hasAttribute(SCOPE_HIDDEN)) return;
+        el.style.display = 'none';
+        el.setAttribute(SCOPE_HIDDEN, '1');
+    }
+
+    function hideCourseNavTab() {
+        var matches = toolHrefMatcher(scopeToolId);
+        var links = document.querySelectorAll('#section-tabs a[href*="/external_tools/"]');
+        for (var i = 0; i < links.length; i++) {
+            if (matches(links[i])) hideScopedElement(links[i].closest('li'));
+        }
+    }
+
+    function hideFileMenuItems(root) {
+        var matches = toolHrefMatcher(scopeToolId);
+        var links = root.querySelectorAll('a[href*="launch_type=file_menu"]');
+        for (var i = 0; i < links.length; i++) {
+            if (!matches(links[i])) continue;
+            hideScopedElement(
+                links[i].closest('[role="menuitem"]') || links[i].closest('li') || links[i]
+            );
+        }
+    }
+
+    function hideEntryPoints(root) {
+        if (!scopeToolId) return;
+        hideCourseNavTab();
+        hideFileMenuItems(root);
+    }
+
+    // Menus rendered into a portal under <body> on open (the rewritten Files
+    // page) never sit under #main, so the main observer cannot see them. This
+    // observer watches direct <body> children only and does no network call
+    // and no page scan: it hides the item inside the added menu node.
+    function startMenuObserver() {
+        if (menuObserver || typeof MutationObserver === 'undefined' || !document.body) return;
+        menuObserver = new MutationObserver(function (mutations) {
+            if (!courseOff || !scopeToolId) return;
+            for (var i = 0; i < mutations.length; i++) {
+                var added = mutations[i].addedNodes;
+                for (var j = 0; j < added.length; j++) {
+                    var node = added[j];
+                    if (node.nodeType !== 1) continue;
+                    var isMenu = node.matches && node.matches('[role="menu"]');
+                    if (isMenu || node.querySelector('[role="menu"]')) hideFileMenuItems(node);
+                }
+            }
+        });
+        menuObserver.observe(document.body, { childList: true, subtree: false });
+    }
+
+    function stopHidingEntryPoints() {
+        if (menuObserver) {
+            menuObserver.disconnect();
+            menuObserver = null;
+        }
+        var hidden = document.querySelectorAll('[' + SCOPE_HIDDEN + ']');
+        for (var i = 0; i < hidden.length; i++) {
+            hidden[i].style.removeProperty('display');
+            hidden[i].removeAttribute(SCOPE_HIDDEN);
+        }
+    }
+
+    /** Reacts to the `course` signal on a batch-status response. `course` is
+     *  null with no course context (user/account Files) or an unknown
+     *  platform: nothing to do. */
+    /** Remember a course decision that came from the SERVER. Called only from
+     *  the two network callers (decorate's batch-status, the probe's), never
+     *  from applyCourseScope: a memo hit also runs applyCourseScope, and
+     *  re-stamping there would refresh the timestamp on every page load so a
+     *  stale decision could never expire. */
+    function rememberCourse(cfg, res) {
+        if (!cfg.courseid || !res || !res.course) return;
+        storageWrite(courseMemoKey(cfg), { t: Date.now(), enabled: res.course.enabled });
+    }
+
+    function applyCourseScope(cfg, res) {
+        if (!res || !res.course) return;
+
+        if (res.course.enabled) {
+            if (courseOff) {
+                courseOff = false;
+                stopHidingEntryPoints();
+            }
+            return;
+        }
+
+        courseOff = true;
+        ensureToolId(cfg, res.platform && res.platform.canvas_tool_id).then(function (id) {
+            if (!id || !courseOff) return;
+            scopeToolId = id;
+            hideEntryPoints(document);
+            startMenuObserver();
+        });
+    }
+
+    /** One zero-item batch-status per page load, for pages with no file links
+     *  (course home, Pages) that would otherwise never learn the course is
+     *  off. Fail-open and never retried. A fresh per-course memo answers
+     *  without a request. */
+    function probeCourseScope(cfg) {
+        if (!cfg.courseid || scopeProbeSent) return;
+        scopeProbeSent = true;
+
+        var memo = readCourseMemo(cfg);
+        if (memo) {
+            applyCourseScope(cfg, { course: { enabled: memo.enabled } });
+            return;
+        }
+        batchStatus(cfg, []).then(function (res) {
+            rememberCourse(cfg, res);
+            applyCourseScope(cfg, res);
+        }).catch(function () { /* fail-open: chips and entry points stay */ });
+    }
+
+    // ---------- Orchestration ----------
+
+    function applyStatuses(cfg, candidates, statuses, platform) {
+        // statuses carries per-item `actions` computed server-side
+        // from the resolved viewer's role + feature_grants. We just
+        // render whichever chip the server says is appropriate — no
+        // client-side role logic.
+        //
+        // `platform.chip_launch_target` controls how every chip launches:
+        // "iframe" (default) → Canvas `external_tools/retrieve` embed (no
+        // tool_id needed — see retrieveEmbedUrl); "tab" → new tab. Iframe
+        // needs only the course id; when it's absent the builders return
+        // null and the chip falls back to its tab URL automatically.
+        var byId = {};
+        for (var i = 0; i < statuses.length; i++) byId[statuses[i].id] = statuses[i];
+
+        var iframeMode = platform && platform.chip_launch_target === 'iframe';
+
+        // Admin-set chip appearance (defaults match historical behaviour).
+        var chipPosition = (platform && platform.chip_position) || 'after';
+        var chipStyle = (platform && platform.chip_style) || 'full';
+
+        renderChips(cfg, candidates, byId, iframeMode, chipPosition, chipStyle);
+    }
+
+    function renderChips(cfg, candidates, byId, iframeMode, chipPosition, chipStyle) {
+        // Admin chip-appearance settings, applied to every chip this pass.
+        var chipOpts = {
+            position: chipPosition === 'before' ? 'before' : 'after',
+            style: chipStyle === 'icon' ? 'icon' : 'full'
+        };
+        for (var j = 0; j < candidates.length; j++) {
+            var cand = candidates[j];
+            var status = byId[cand.id] || { state: 'unknown', actions: {} };
+            var state = status.state;
+            var actions = status.actions || {};
+            // Server's media_type (resolved from the matched LtiDocument
+            // or inferred from extension) overrides the client-side
+            // provisional value — keeps the chip's click handler routing
+            // honest if the file's true type differs from our guess.
+            if (status.media_type) cand.mediaType = status.media_type;
+            var anchor = findLiveAnchor(cand);
+            if (!anchor) continue;
+            anchor.setAttribute(PROCESSED, state);
+            var keyStr = candKey(cand);
+            // The chip may already sit on EITHER side of the anchor (position
+            // setting), so check both siblings before re-injecting.
+            var nextEl = anchor.nextElementSibling;
+            var prevEl = anchor.previousElementSibling;
+            var existingChip = (nextEl && nextEl.getAttribute(CHIP_MARKER) === keyStr) ? nextEl
+                : (prevEl && prevEl.getAttribute(CHIP_MARKER) === keyStr) ? prevEl : null;
+            anchor.removeAttribute(RECHECK);
+            // Students only ever get the accessible version: the server reports
+            // their converting and failed files as unknown, and only staff carry
+            // make_accessible. A course switched off comes back as unknown with
+            // every action false, so renders nothing.
+            var count = status.issue_count;
+            var variant = null;
+            if (state === 'accessible') {
+                if (actions.open) variant = 'accessible';
+            } else if (actions.make_accessible) {
+                variant = state === 'pending' ? 'converting'
+                    : state === 'failed' ? 'failed'
+                    : (typeof count === 'number' && count > 0) ? 'fix'
+                    : 'make';
+            }
+            // A chip showing the right state stays; any other goes, including a
+            // chip from a pass made before the course was switched off.
+            if (existingChip) {
+                if (variant && existingChip.getAttribute('data-bifrost-chip') === variant) continue;
+                existingChip.parentNode.removeChild(existingChip);
+            }
+            // Nothing to render and nothing left to clean up. The file's own
+            // anchor is untouched throughout — chips are siblings, never a
+            // rewrite of the href — so the title link keeps its native Canvas
+            // behaviour and opens the original document.
+            if (!variant) continue;
+
+            var opts = {
+                position: chipOpts.position,
+                style: chipOpts.style,
+                filename: (anchor.textContent || '').trim() || 'this file'
+            };
+            var chip = null;
+            if (variant === 'accessible') {
+                var viewIframeUrl = iframeMode
+                    ? buildAccessibleUrlIframe(cfg, cand)
+                    : null;
+                chip = viewIframeUrl
+                    ? makeChip('accessible', viewIframeUrl, keyStr, true, opts)
+                    : makeChip('accessible', buildAccessibleUrl(cfg, cand), keyStr, false, opts);
+            } else if (variant === 'converting') {
+                chip = makeChip('converting', null, keyStr, false, opts);
+            } else if (variant === 'failed') {
+                // Retry launches with auto=convert so the tutor screen starts a
+                // fresh conversion on arrival (see buildMakeAccessibleUrlIframe).
+                var retryIframeUrl = iframeMode
+                    ? buildMakeAccessibleUrlIframe(cfg, cand, true)
+                    : null;
+                chip = retryIframeUrl
+                    ? makeChip('failed', retryIframeUrl, keyStr, true, opts)
+                    : makeChip('failed', buildMakeAccessibleUrlTab(cfg, cand, true), keyStr, false, opts);
+            } else {
+                // unaudited or unknown: the tutor screen resolves the file itself.
+                var iframeUrl = iframeMode
+                    ? buildMakeAccessibleUrlIframe(cfg, cand)
+                    : null;
+                var tabUrl = buildMakeAccessibleUrlTab(cfg, cand);
+                if (variant === 'fix') {
+                    // In iframe mode the pop-up's actions embed too: openConvertModal
+                    // detects placement URLs and navigates the Canvas window itself.
+                    var modalBase = iframeUrl || tabUrl;
+                    var convertUrl = iframeMode
+                        ? buildMakeAccessibleUrlIframe(cfg, cand, true)
+                        : buildMakeAccessibleUrlTab(cfg, cand, true);
+                    opts.issueCount = count;
+                    opts.onActivate = (function (fname, n, cUrl, manageUrl) {
+                        return function (openerEl) {
+                            openConvertModal(fname, n, cUrl, manageUrl, openerEl);
+                        };
+                    })(opts.filename, count, convertUrl, modalBase);
+                    // inlineLaunch stays FALSE: the pop-up owns the primary
+                    // click (onActivate preventDefaults), and the top-nav
+                    // listener would race it. Modifier-clicks follow the
+                    // href, where the placement URL still embeds.
+                    chip = makeChip('fix', modalBase, keyStr, false, opts);
+                } else if (iframeUrl) {
+                    chip = makeChip('make', iframeUrl, keyStr, true /* inlineLaunch — see makeChip */, opts);
+                } else {
+                    // Tab mode, or iframe mode with no course id (the builders return null).
+                    chip = makeChip('make', tabUrl, keyStr, false, opts);
+                }
+            }
+            if (chip && anchor.parentNode) {
+                if (chipOpts.position === 'before') {
+                    anchor.parentNode.insertBefore(chip, anchor);
+                } else {
+                    anchor.parentNode.insertBefore(chip, anchor.nextSibling);
+                }
+            }
+        }
+    }
+
+    function decorate(cfg, root, attempt) {
+        attempt = attempt || 0;
+        var cands = collectCandidates(root);
+        if (cands.length === 0) {
+            probeCourseScope(cfg);
+            return;
+        }
+        // A real batch-status carries the course signal, so the probe is moot.
+        scopeProbeSent = true;
+
+        // Wait for the tokens sheet too, so no chip paints unstyled.
+        Promise.all([batchStatus(cfg, cands), loadTokensSheet()]).then(function (results) {
+            var res = results[0];
+            rememberCourse(cfg, res);
+            applyCourseScope(cfg, res);
+            applyStatuses(cfg, cands, res.statuses || [], res.platform);
+        }).catch(function (err) {
+            for (var i = 0; i < cands.length; i++) {
+                var a = findLiveAnchor(cands[i]);
+                if (a) a.removeAttribute(PROCESSED);
+            }
+            if (window.console && console.warn) {
+                console.warn('[bifrost] batch-status failed (attempt ' + attempt + ')', err);
+            }
+            if (attempt < 4) {
+                setTimeout(function () { decorate(cfg, root, attempt + 1); },
+                           Math.min(8000, 1000 * Math.pow(2, attempt)));
+            }
+        });
+    }
+
+    function refreshDecorations(cfg, root) {
+        var anchors = (root || document).querySelectorAll('a[' + PROCESSED + ']');
+        for (var i = 0; i < anchors.length; i++) {
+            var a = anchors[i];
+            var next = a.nextElementSibling;
+            if (!next || !next.getAttribute(CHIP_MARKER)) {
+                a.removeAttribute(PROCESSED);
+            }
+        }
+        decorate(cfg, root);
+    }
+
+    // A chip is decided once, so "Converting…" and "Failed" would stay until a
+    // reload. The tutor usually comes back from the Remilo tab (a retry runs
+    // there), so each time this tab is shown again those chips are asked about
+    // once more; renderChips swaps any whose state moved on.
+    function recheckInFlight(cfg) {
+        var hosts = document.querySelectorAll(
+            '[data-bifrost-chip="converting"], [data-bifrost-chip="failed"]');
+        if (hosts.length === 0) return;
+        for (var i = 0; i < hosts.length; i++) {
+            var prev = hosts[i].previousElementSibling;
+            var next = hosts[i].nextElementSibling;
+            var anchor = (prev && prev.hasAttribute(PROCESSED)) ? prev
+                : (next && next.hasAttribute(PROCESSED)) ? next : null;
+            if (!anchor) continue;
+            anchor.removeAttribute(PROCESSED);
+            anchor.setAttribute(RECHECK, '1');
+        }
+        decorate(cfg, document);
+    }
+
+    function start(cfg) {
+        decorate(cfg, document);
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') recheckInFlight(cfg);
+        });
+
+        // Canvas surfaces that contain file links: course main, modules,
+        // pages, files index. They share the `.ic-app-main-content` wrapper.
+        var target = document.querySelector('#main')
+            || document.querySelector('.ic-app-main-content')
+            || document.body;
+
+        setTimeout(function () {
+            refreshDecorations(cfg, target);
+        }, 1500);
+        setTimeout(function () {
+            refreshDecorations(cfg, target);
+        }, 4000);
+
+        if (!target || typeof MutationObserver === 'undefined') return;
+
+        var pending = false;
+        var observer = new MutationObserver(function () {
+            if (pending) return;
+            pending = true;
+            setTimeout(function () {
+                pending = false;
+                refreshDecorations(cfg, target);
+            }, 200);
+        });
+        observer.observe(target, { childList: true, subtree: true });
+
+        // Canvas's pushState routing — re-decorate when the URL changes.
+        window.addEventListener('popstate', function () {
+            setTimeout(function () {
+                if (courseOff && scopeToolId) hideCourseNavTab();
+                refreshDecorations(cfg, target);
+            }, 500);
+        });
+    }
+
+    // ---------- Bootstrap ----------
+
+    // Canvas's BrandConfig.js_overrides is loaded LATE (after most of
+    // Canvas's own JS), but `window.ENV` is populated synchronously
+    // by Rails on every page render. Safe to read it here without
+    // waiting for DOMContentLoaded.
+    var cfg = getConfig();
+    if (!cfg) return;
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { start(cfg); });
+    } else {
+        start(cfg);
+    }
+})();
