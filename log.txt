@@ -1,0 +1,11 @@
+Git Commands used:
+git init
+git add .gitignore
+git commit -m "Initialize repository and add .gitignore rules"
+git add product.html styles.css
+git commit -m "Create base layout structure and initial styling"
+git add.
+git commit -m "Add user input form controls and layout alignment"
+git commit -m "Add input validation checks and error messaging"
+git add README.md
+git commit -M "Add README with project overview, setup steps, and features"
