@@ -9,3 +9,7 @@ git commit -m "Add user input form controls and layout alignment"
 git commit -m "Add input validation checks and error messaging"
 git add README.md
 git commit -M "Add README with project overview, setup steps, and features"
+git branch -M main
+git remote add origin https://github.com/martinapelfrey-commits/simple-website-2
+git remote add origin https://github.com
+git push -u origin man
